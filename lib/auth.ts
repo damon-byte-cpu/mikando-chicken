@@ -1,50 +1,57 @@
-import NextAuth from "next-auth"
-import Credentials from "next-auth/providers/credentials"
-import bcrypt from "bcryptjs"
-import { z } from "zod"
-import { prisma } from "@/lib/prisma"
+import { cookies } from "next/headers"
+import { createHmac, timingSafeEqual } from "crypto"
 
-const credentialsSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(1),
-})
+// ─────────────────────────────────────────────────────────────────────────
+// Simple password-based admin auth.
+// The single admin password lives in the ADMIN_PASSWORD env var.
+// On successful login we set a signed, http-only cookie so the session
+// can't be forged from the client.
+// ─────────────────────────────────────────────────────────────────────────
 
-export const { handlers, auth, signIn, signOut } = NextAuth({
-  session: { strategy: "jwt" },
-  pages: {
-    signIn: "/admin/login",
-  },
-  providers: [
-    Credentials({
-      credentials: {
-        email: { label: "Email", type: "email" },
-        password: { label: "Password", type: "password" },
-      },
-      async authorize(raw) {
-        const parsed = credentialsSchema.safeParse(raw)
-        if (!parsed.success) return null
+const COOKIE_NAME = "mikando_admin"
 
-        const { email, password } = parsed.data
-        const user = await prisma.user.findUnique({ where: { email } })
-        if (!user) return null
+function getSecret() {
+  // Falls back to ADMIN_PASSWORD so a separate secret is optional.
+  return process.env.AUTH_SECRET || process.env.ADMIN_PASSWORD || "mikando-dev-secret"
+}
 
-        const valid = await bcrypt.compare(password, user.password)
-        if (!valid) return null
+// Deterministic token derived from the password + secret.
+function makeToken() {
+  return createHmac("sha256", getSecret()).update("authenticated").digest("hex")
+}
 
-        return { id: user.id, email: user.email, name: user.name }
-      },
-    }),
-  ],
-  callbacks: {
-    async jwt({ token, user }) {
-      if (user) token.id = user.id
-      return token
-    },
-    async session({ session, token }) {
-      if (session.user && token.id) {
-        session.user.id = token.id as string
-      }
-      return session
-    },
-  },
-})
+export function verifyPassword(input: string): boolean {
+  const expected = process.env.ADMIN_PASSWORD
+  if (!expected) return false
+  const a = Buffer.from(input)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
+
+export async function createSession() {
+  const cookieStore = await cookies()
+  cookieStore.set(COOKIE_NAME, makeToken(), {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 7, // 7 days
+  })
+}
+
+export async function destroySession() {
+  const cookieStore = await cookies()
+  cookieStore.delete(COOKIE_NAME)
+}
+
+export async function isAuthenticated(): Promise<boolean> {
+  const cookieStore = await cookies()
+  const token = cookieStore.get(COOKIE_NAME)?.value
+  if (!token) return false
+  const expected = makeToken()
+  const a = Buffer.from(token)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length) return false
+  return timingSafeEqual(a, b)
+}
